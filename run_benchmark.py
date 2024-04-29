@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import argparse
 import pickle
 from pathlib import Path
@@ -69,6 +70,7 @@ class Denoiser:
         inp_rggb = self.ksigma(inp_rggb_01, iso) * self.inp_scale
 
         inp = np.ascontiguousarray(inp_rggb)
+        inp = mge.Tensor(inp)
         pred = self.net(inp)[0] / self.inp_scale
 
         # import ipdb; ipdb.set_trace()
@@ -81,6 +83,9 @@ class Denoiser:
 
 
 def run_benchmark(model_path, bm_loader: BenchmarkLoader):
+    output_folder_path = 'results'
+    if not os.path.isdir(output_folder_path):
+        os.mkdir(output_folder_path)
 
     ksigma = KSigma(
         K_coeff=[0.0005995267, 0.00868861],
@@ -92,7 +97,7 @@ def run_benchmark(model_path, bm_loader: BenchmarkLoader):
     PSNRs, SSIMs = [], []
 
     bar = tqdm(bm_loader)
-    for input_bayer, gt_bayer, meta in bar:
+    for data_idx, (input_bayer, gt_bayer, meta) in enumerate(bar):
         bar.set_description(meta.name)
         assert meta.bayer_pattern == 'BGGR'
         input_bayer, gt_bayer = RawUtils.bggr2rggb(input_bayer, gt_bayer)
@@ -109,31 +114,38 @@ def run_benchmark(model_path, bm_loader: BenchmarkLoader):
         psnrs = []
         ssims = []
 
-        for x0, y0, x1, y1 in meta.ROIs:
+        for roi_idx, (x0, y0, x1, y1) in enumerate(meta.ROIs):
+            inp_patch = inp_rgb[y0:y1, x0:x1]
             pred_patch = pred_rgb[y0:y1, x0:x1]
             gt_patch = gt_rgb[y0:y1, x0:x1]
+            
 
             psnr = skimage.metrics.peak_signal_noise_ratio(gt_patch, pred_patch)
-            ssim = skimage.metrics.structural_similarity(gt_patch, pred_patch, multichannel=True)
+            # psnr = skimage.metrics.peak_signal_noise_ratio(gt_patch, inp_patch)
+            # ssim = skimage.metrics.structural_similarity(gt_patch, pred_patch, multichannel=True)
             psnrs.append(float(psnr))
-            ssims.append(float(ssim))
+            # ssims.append(float(ssim))
+        cv2.imwrite(f'{output_folder_path}/input_{data_idx:05d}.bmp', inp_rgb[...,::-1]*255)
+        cv2.imwrite(f'{output_folder_path}/pred_{data_idx:05d}.bmp', pred_rgb[...,::-1]*255)
+        cv2.imwrite(f'{output_folder_path}/gt_{data_idx:05d}.bmp', gt_rgb[...,::-1]*255)
 
         bar.set_description(meta.name+' ✓✓')
 
         PSNRs = PSNRs + psnrs   # list append
-        SSIMs = SSIMs + ssims
+        # SSIMs = SSIMs + ssims
 
     mean_psnr = np.mean(PSNRs)
-    mean_ssim = np.mean(SSIMs)
+    # mean_ssim = np.mean(SSIMs)
     print("mean PSNR:", mean_psnr)
-    print("mean SSIM:", mean_ssim)
+    # print("mean SSIM:", mean_ssim)
 
 
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('model', type=Path)
-    parser.add_argument('--benchmark', type=Path)
+    # parser.add_argument('-m', '--model', type=Path, default='checkpoints/20240401151050/epoch_4000_loss_2.4284188747406006.pkl')
+    parser.add_argument('-m', '--model', type=Path, default='models/mge_pretrained.ckp')
+    parser.add_argument('--benchmark', type=Path, default='/home/user/work/data/PMRID/trainingset/benchmark.json')
 
     args = parser.parse_args()
 

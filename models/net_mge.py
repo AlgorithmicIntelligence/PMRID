@@ -4,7 +4,7 @@ from collections import OrderedDict
 import megengine as mge
 import megengine.module as M
 import megengine.functional as F
-
+from megengine.utils.module_stats import module_stats
 
 def Conv2D(
         in_channels: int, out_channels: int,
@@ -124,43 +124,59 @@ class DecoderStage(M.Module):
 
 class Network(M.Module):
 
-    def __init__(self):
+    def __init__(self, mode='vi'):
         super().__init__()
+        self.mode = mode
+        if mode=='vi':
+            self.conv0 = Conv2D(in_channels=1, out_channels=4, kernel_size=3, padding=1, stride=1, is_seperable=False, has_relu=True)
+            self.enc1 = EncoderStage(in_channels=4, out_channels=16, num_blocks=2)
+            self.enc2 = EncoderStage(in_channels=16, out_channels=32, num_blocks=2)
+            self.enc3 = EncoderStage(in_channels=32, out_channels=64, num_blocks=4)
+            self.enc4 = EncoderStage(in_channels=64, out_channels=128, num_blocks=4)
+            self.out = Conv2D(in_channels=128, out_channels=1, kernel_size=1, stride=1, padding=0, is_seperable=False, has_relu=False)
+        else:
+        
+            self.conv0 = Conv2D(in_channels=4, out_channels=16, kernel_size=3, padding=1, stride=1, is_seperable=False, has_relu=True)
+            self.enc1 = EncoderStage(in_channels=16, out_channels=64, num_blocks=2)
+            self.enc2 = EncoderStage(in_channels=64, out_channels=128, num_blocks=2)
+            self.enc3 = EncoderStage(in_channels=128, out_channels=256, num_blocks=4)
+            self.enc4 = EncoderStage(in_channels=256, out_channels=512, num_blocks=4)
 
-        self.conv0 = Conv2D(in_channels=4, out_channels=16, kernel_size=3, padding=1, stride=1, is_seperable=False, has_relu=True)
-        self.enc1 = EncoderStage(in_channels=16, out_channels=64, num_blocks=2)
-        self.enc2 = EncoderStage(in_channels=64, out_channels=128, num_blocks=2)
-        self.enc3 = EncoderStage(in_channels=128, out_channels=256, num_blocks=4)
-        self.enc4 = EncoderStage(in_channels=256, out_channels=512, num_blocks=4)
+            self.encdec = Conv2D(in_channels=512, out_channels=64, kernel_size=3, padding=1, stride=1, is_seperable=True, has_relu=True)
+            self.dec1 = DecoderStage(in_channels=64, skip_in_channels=256, out_channels=64)
+            self.dec2 = DecoderStage(in_channels=64, skip_in_channels=128, out_channels=32)
+            self.dec3 = DecoderStage(in_channels=32, skip_in_channels=64, out_channels=32)
+            self.dec4 = DecoderStage(in_channels=32, skip_in_channels=16, out_channels=16)
 
-        self.encdec = Conv2D(in_channels=512, out_channels=64, kernel_size=3, padding=1, stride=1, is_seperable=True, has_relu=True)
-        self.dec1 = DecoderStage(in_channels=64, skip_in_channels=256, out_channels=64)
-        self.dec2 = DecoderStage(in_channels=64, skip_in_channels=128, out_channels=32)
-        self.dec3 = DecoderStage(in_channels=32, skip_in_channels=64, out_channels=32)
-        self.dec4 = DecoderStage(in_channels=32, skip_in_channels=16, out_channels=16)
-
-        self.out0 = DecoderBlock(in_channels=16, out_channels=16, kernel_size=3)
-        self.out1 = Conv2D(in_channels=16, out_channels=4, kernel_size=3, stride=1, padding=1, is_seperable=False, has_relu=False)
+            self.out0 = DecoderBlock(in_channels=16, out_channels=16, kernel_size=3)
+            self.out1 = Conv2D(in_channels=16, out_channels=4, kernel_size=3, stride=1, padding=1, is_seperable=False, has_relu=False)
 
     def forward(self, inp):
+        if self.mode == 'vi':
+            conv0 = self.conv0(inp)
+            conv1 = self.enc1(conv0)
+            conv2 = self.enc2(conv1)
+            conv3 = self.enc3(conv2)
+            conv4 = self.enc4(conv3)
+            pred = self.out(conv4)
+        else:
+            conv0 = self.conv0(inp)
+            conv1 = self.enc1(conv0)
+            conv2 = self.enc2(conv1)
+            conv3 = self.enc3(conv2)
+            conv4 = self.enc4(conv3)
 
-        conv0 = self.conv0(inp)
-        conv1 = self.enc1(conv0)
-        conv2 = self.enc2(conv1)
-        conv3 = self.enc3(conv2)
-        conv4 = self.enc4(conv3)
+            conv5 = self.encdec(conv4)
 
-        conv5 = self.encdec(conv4)
+            up3 = self.dec1((conv5, conv3))
+            up2 = self.dec2((up3, conv2))
+            up1 = self.dec3((up2, conv1))
+            x = self.dec4((up1, conv0))
 
-        up3 = self.dec1((conv5, conv3))
-        up2 = self.dec2((up3, conv2))
-        up1 = self.dec3((up2, conv1))
-        x = self.dec4((up1, conv0))
+            x = self.out0(x)
+            x = self.out1(x)
 
-        x = self.out0(x)
-        x = self.out1(x)
-
-        pred = inp + x
+            pred = inp + x
         return pred
 
 
@@ -177,5 +193,11 @@ if __name__ == "__main__":
     net = Network()
     img = mge.tensor(np.random.randn(1, 4, 64, 64).astype(np.float32))
     out = net(img)
-
+    total_stats, stats_details = module_stats(officical_model, 
+                                              inputs=official_input, 
+                                              cal_params=True,
+                                              cal_flops=True,
+                                              cal_activations=True,
+                                              logging_to_stdout=True
+                                              )
 # vim: ts=4 sw=4 sts=4 expandtab
