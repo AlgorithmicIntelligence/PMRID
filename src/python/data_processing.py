@@ -307,66 +307,70 @@ class ValidationDataloader():
         
         return images, np.array(images_g_mean)
     
-class CleanRawImages(Dataset):
 
-    def __init__(self, *, index_file: Optional[str]=None, data_txt: Optional[SmartPath], opts: DataAugOptions):
-        """
-        Args:
-            - data_dir: a directory that contains "index.json" and raw images
-            - index_file: the absolute path to the index file
-        """
-        super().__init__()
-
-        # assert not (index_file is None and data_dir is None)
-
-        # if data_dir is None:
-        #     index_file = SmartPath(index_file)
-        # else:
-        #     assert index_file is None
-        #     index_file = data_dir / "index.json"
-
-        self.opts = DataAugOptions()
-        self.filelist: List[RawImageItem] = []
-        self.filelist: List = []
+class DataLoader():
+    def __init__(self, image_info_file, image_shape=(2848,4256), mode='train'):
+        self.image_info_file = image_info_file
+        self.mode = mode
         
-        with open(data_txt, 'r') as f:
-            raw_paths = f.read().splitlines()
+        # Read image info from file
+        self.image_infos = self._read_image_info()
+        self.image_height, self.image_width = image_shape
+        self.num_images = len(self.image_infos)
+        self.cur_image_index = 0
         
-        for raw_path in raw_paths:
-            if not raw_path.endswith('.ARW'):
-                continue
-            # raw_path = os.path.join(data_dir, raw_name)
-            raw_info = rawpy.imread(raw_path)
-            # width = raw_info.sizes.raw_width
-            # height = raw_info.sizes.raw_height
-            height, width = raw_info.raw_image_visible.shape
-            black_level = raw_info.black_level_per_channel[0]
-            white_level = raw_info.white_level
-            bayer_pattern = raw_info.color_desc.decode()
-            if bayer_pattern == 'RGBG':
-                bayer_pattern = 'RGGB'
-            bayer_pattern = BayerPattern(bayer_pattern)
-            g_mean_01 = raw_info.raw_image_visible.mean() / white_level
-            item = RawImageItem(path=raw_path,
-                                width=width,
-                                height=height,
-                                black_level=black_level,
-                                white_level=white_level,
-                                bayer_pattern=bayer_pattern,
-                                g_mean_01=g_mean_01)            
-            self.filelist.append(item)
-        print(f'Numboer of RawImages: {len(self.filelist)} have been loaded')
-        # with index_file.open() as f:
-        #     items = [RawImageItem.parse_obj(x) for x in json.load(f)]
-        #     for item in items:
-        #         if data_dir is not None:
-        #             item.path = str(data_dir / item.path)
-        #         self.filelist.append(item)
-
-    def __len__(self):
-        return len(self.filelist)
+    def _read_image_info(self):
+        with open(self.image_info_file, 'r') as f:
+            image_infos = [line.split() for line in f.read().splitlines()]    
+        return image_infos    
     
-    def random_flip_and_crop(self, img: np.ndarray, src_bayer_pattern: BayerPattern) -> np.ndarray:
+    def reset_index_and_shuffle_image_infos(self):
+        self.cur_image_index = 0
+        random.shuffle(self.image_infos)
+
+    def get_samples(self, sample_size=1):
+        # input_batch = list()
+        for _ in range(sample_size):
+            sample_info = self.image_infos[self.cur_image_index]
+            self.cur_image_index += 1
+            samples, samples_g_mean = self._process_samples(sample_info)    
+        return samples, samples_g_mean
+    
+    def __len__(self):
+        return self.num_images
+    
+    def __getitem__(self):
+        return self.get_samples(1)
+         
+    def _process_samples(self, sample_info, num_patches=64, black_level=512, white_level=16383, output_shape=(512, 512)):
+        image_path, iso = sample_info
+        h, w = self.image_height, self.image_width
+        oh, ow = output_shape
+
+        images = list()
+        images_g_mean = list()
+        
+        rawimg = np.fromfile(image_path, np.uint16).reshape(h, w)
+        rawimg = (rawimg - black_level) / (white_level - black_level)
+        if self.mode != 'train':
+            num_patches = 1
+        
+        for _ in range(num_patches):
+            if self.mode == 'train':
+                raw_crop = self.random_flip_and_crop(rawimg, output_shape=output_shape)  
+            else:
+                raw_crop = rawimg      
+            images.append(raw_crop)
+            # images_g_mean.append(g_mean)
+        images = np.stack(images)
+        # images_g_mean = np.stack(images_g_mean)
+        oh, ow = images.shape[1:]
+        rggb = images.reshape(-1, oh//2, 2, ow//2, 2).transpose(0, 1, 3, 2, 4).reshape(-1, oh//2, ow//2, 4)
+        rggb_mean = rggb.mean(axis=(1, 2))
+        images_g_mean = rggb_mean[:, 1:3].mean(axis=1)
+        return rggb, images_g_mean
+        
+    def random_flip_and_crop(self, img: np.ndarray, src_bayer_pattern: BayerPattern=BayerPattern.BGGR, output_shape=(512, 512)) -> np.ndarray:
         """
         Random flip and crop a bayter-patterned image, and normalize the bayer pattern to RGGB.
         """
@@ -388,13 +392,13 @@ class CleanRawImages(Dataset):
         if flip_ud:
             crop_y_offset = (crop_y_offset + 1) % 2
 
-        H0, W0 = img.shape
-        tH, tW = self.opts.output_shape
+        h, w = img.shape
+        ho, wo = output_shape
 
-        x0, y0 = np.random.randint(0, W0 - tW), np.random.randint(0, H0 - tH)
+        x0, y0 = np.random.randint(0, w - wo), np.random.randint(0, h - ho)
         x0, y0 = x0 // 2 * 2 + crop_x_offset, y0 // 2 * 2 + crop_y_offset
 
-        img_crop = img[y0:y0+tH, x0:x0+tW]
+        img_crop = img[y0:y0+ho, x0:x0+wo]
         if flip_lr:
             img_crop = np.flip(img_crop, axis=1)
         if flip_ud:
@@ -402,90 +406,45 @@ class CleanRawImages(Dataset):
 
         return img_crop
 
-    def __getitem__(self, index: int):
-        item = self.filelist[index]
-        rawimg = rawpy.imread(item.path).raw_image_visible
-        # buf = smart_load_from(item.path)
-        # rawimg = np.fromfile(buf, dtype=np.uint16).reshape((item.height, item.width))
+
+class DataProcessor:
+    def __init__(self, noise_k: Tuple[float, float], noise_b: Tuple[float, float, float]):
+        self.poly_k = np.poly1d(noise_k)
+        self.poly_b = np.poly1d(noise_b)
         
-        # random crop to output size
-        rawimg = self.random_flip_and_crop(rawimg, item.bayer_pattern).astype(np.float32)
-
-        raw01 = (rawimg - item.black_level) / (item.white_level - item.black_level)
-        H, W = raw01.shape
-        # pixel shuffle to RGGB image
-        rggb01 = raw01.reshape(H//2, 2, W//2, 2).transpose(0, 2, 1, 3).reshape(H//2, W//2, 4)
-        return rggb01, np.array(item.g_mean_01)
-
-
-class NoiseProfileFunc:
-
-    def __init__(self, noise_profile: NoiseProfile):
-        self.polyK = np.poly1d(noise_profile.K)
-        self.polyB = np.poly1d(noise_profile.B)
-        self.value_scale = noise_profile.value_scale
-
-    def __call__(self, iso, value_scale=959.0):
-        r = value_scale / self.value_scale
-        k = self.polyK(iso) * r
-        b = self.polyB(iso) * r * r
-
-        return k, b
-
-
-class DataAug:
-
-    def __init__(self, opts: DataAugOptions):
-        self.opts = opts
-        self.noise_func = NoiseProfileFunc(opts.noise_profile)
-
-    def transform(self, batch_img01: np.ndarray, batch_g_mean: float, batch_iso=None, mode='vi') -> Tuple[mge.Tensor, mge.Tensor, mge.Tensor]:
-        """
-        Args:
-            - img: [-black/camera_value_scale, 1.0]
-
-        Returns:
-            - noisy_img
-            - iso
-        """
+        self.target_brighness_range: Tuple[float, float] = (0.02, 0.5)
+        self.anchor_iso: float = 1600.0
+        self.iso_range: Tuple[float, float] = (100, 6400)
+        self.value_scale = 959
+        self.debug_cnt = 0
         
-        batch_img01 = np.transpose(batch_img01, (0, 3, 1, 2))
-        batch_imgs = mge.tensor(batch_img01) * self.opts.camera_value_scale
-        batch_gt = self.brightness_aug(batch_imgs, batch_g_mean)
-        batch_imgs, batch_iso = self.add_noise(batch_gt, batch_iso)
-        cvt_k, cvt_b = self.k_sigma(batch_iso)
-        cvt_k = cvt_k.astype(np.float32)
-        cvt_b = cvt_b.astype(np.float32)
-
-        batch_imgs = batch_imgs * cvt_k.reshape(-1, 1, 1, 1) + cvt_b.reshape(-1, 1, 1, 1)
-        batch_gt = batch_gt * cvt_k.reshape(-1, 1, 1, 1) + cvt_b.reshape(-1, 1, 1, 1)
-        # print(f'ksigma - inputMax: {batch_imgs.max().item()}, inputMin: {batch_imgs.min().item()}, goldenMax: {batch_gt.max().item()}, goldenMin: {batch_gt.min().item()}, cvt_k: {cvt_k}, cvt_b: {cvt_b}')
-        batch_imgs /= self.opts.camera_value_scale
-        batch_gt /= self.opts.camera_value_scale
-        # print(f'norm - inputMax: {batch_imgs.max().item()}, inputMin: {batch_imgs.min().item()}, goldenMax: {batch_gt.max().item()}, goldenMin: {batch_gt.min().item()}, cvt_k: {cvt_k}, cvt_b: {cvt_b}')
-        if mode == 'vi':
-            b, c, h, w = batch_gt.shape
-            h_radius, w_radius = (np.array([h, w])-1)//2
-            batch_gt = batch_gt[:, :, h_radius, w_radius].reshape(b, c, 1, 1)
-        return (batch_imgs, batch_gt, cvt_k)
-
-    def k_sigma(self, iso: float) -> Tuple[float, float]:
-        k, sigma = self.noise_func(iso, value_scale=self.opts.camera_value_scale)
-        k_a, sigma_a = self.noise_func(self.opts.anchor_iso, value_scale=self.opts.camera_value_scale)
-
-        cvt_k = k_a / k
-        cvt_b = (sigma / (k ** 2) - sigma_a / (k_a ** 2)) * k_a
-
-        return cvt_k, cvt_b
-
-    def brightness_aug(self, img_batch: mge.Tensor, orig_gmean: List[float]) -> mge.Tensor:
-        low, high = self.opts.target_brighness_range
-        N = len(orig_gmean)
-        btarget = np.exp(np.random.uniform(np.log(low), np.log(high), size=(N, )))
-        s = np.clip(btarget / orig_gmean, 0.01, 1.0, dtype=np.float32)
-        # print(f'brightness - orig_gmean: {orig_gmean}, img_batch_dtype: {img_batch.dtype}, s.dtype: {s.dtype}')
-        return img_batch * s.reshape(-1, 1, 1, 1)
-
+        
+    def transform(self, imgs, images_g_mean, value_scale=959.0, channel_last=True, isos=None, mode='train'):
+        # change into channel first
+        if channel_last:
+            imgs = np.transpose(imgs, (0, 3, 1, 2))
+        imgs = mge.tensor(imgs) * value_scale      
+        if mode == 'train': 
+            imgs_gt = self.brightness_augmentation(imgs, images_g_mean)
+            imgs_noisy, isos = self.add_noise(imgs_gt)
+        else:
+            imgs_gt = imgs
+            imgs_noisy = imgs
+        # black_level=512
+        # white_level=16383
+        # debug_imgs_noisy = imgs_noisy/value_scale * (white_level-black_level) + black_level
+        # debug_imgs_gt = imgs_gt/value_scale * (white_level-black_level) + black_level
+        # with open(f'{self.debug_cnt}_noisy_r.raw', 'wb') as f:
+        #     f.write(np.array(debug_imgs_noisy[0, 0]).astype(np.uint16).tobytes())
+        # with open(f'{self.debug_cnt}_gt_r.raw', 'wb') as f:
+        #     f.write(np.array(debug_imgs_gt[0, 0]).astype(np.uint16).tobytes())
+        self.debug_cnt += 1
+        imgs_gt, cvt_k, cvt_b = self.k_sigma_transform(imgs_gt, isos)
+        imgs_noisy, cvt_k, cvt_b = self.k_sigma_transform(imgs_noisy, isos)
+        imgs_noisy /= value_scale
+        imgs_gt /= value_scale
+        return imgs_noisy, imgs_gt, cvt_k, cvt_b
+    
     def add_noise(self, img: mge.Tensor, isos=None) -> Tuple[mge.Tensor, float]:
         """
         Args:
@@ -498,21 +457,50 @@ class DataAug:
 
         N = img.shape[0]
         if isos == None:
-            isos = np.random.uniform(*self.opts.iso_range, size=(N, ))
-        k, b = self.noise_func(isos, value_scale=self.opts.camera_value_scale)
+            isos = np.random.uniform(*self.iso_range, size=(N, ))
+        k, b = self.noise_func(isos)
         k = k.reshape(-1, 1, 1, 1).astype(np.float32)
-        b = b.reshape(-1, 1, 1, 1).astype(np.float32)
-        
-        
-        print(f'IMGSHAPE: {img.shape}, KSHAPE: {k.shape}, imgdtype: {img.dtype}, kdtype: {k.dtype}')
+        b = b.reshape(-1, 1, 1, 1).astype(np.float32)        
+        # print(f'IMGSHAPE: {img.shape}, KSHAPE: {k.shape}, {img.max().item()} {img.min().item()} {k.min().item()}, {k.max().item()}')
 
-        # print(f'img.dtype: {img.dtype}, k: {k}, b: {b}')
-        # print(f'img max: {(img).max()}, img min: {(img).min()}')
-        # print(f'img/k max: {(img/k).max()}, img/k min: {(img/k).min()}')
+        # print(f'IMGSHAPE: {img.shape}, KSHAPE: {k.shape}, imgdtype: {img.dtype}, kdtype: {k.dtype}')
+
         # shot_noisy = megengine.random.poisson((img / k).clip(0, 1)) * k
+        print(f'poisson: {img.shape} {k} {img.min()} {img.max()}')
         shot_noisy = megengine.random.poisson(img / k) * k
         read_noisy = megengine.random.normal(size=img.shape) * np.sqrt(b)
         noisy = shot_noisy + read_noisy
         noisy = F.round(noisy)
-
         return noisy, isos
+                
+    def brightness_augmentation(self, img_batch: mge.Tensor, images_g_mean: List[float]) -> mge.Tensor:
+        low, high = self.target_brighness_range
+        N = len(images_g_mean)
+        btarget = np.exp(np.random.uniform(np.log(low), np.log(high), size=(N, )))
+        s = np.clip(btarget / images_g_mean, 0.01, 1.0, dtype=np.float32)
+        # print(f'brightness - orig_gmean: {images_g_mean}, img_batch_dtype: {img_batch.dtype}, s.dtype: {s.dtype}')
+        return img_batch * s.reshape(-1, 1, 1, 1)
+    
+    def noise_func(self, iso):
+        k = self.poly_k(iso)
+        b = self.poly_b(iso)
+        return k, b   
+    
+    def k_sigma(self, isos: float, anchor_iso) -> Tuple[float, float]:
+        k, sigma = self.noise_func(isos)
+        k_a, sigma_a = self.noise_func(anchor_iso)
+
+        cvt_k = k_a / k
+        cvt_b = (sigma / (k ** 2) - sigma_a / (k_a ** 2)) * k_a
+
+        return cvt_k, cvt_b    
+        
+    def k_sigma_transform(self, imgs, isos):    
+
+        
+        cvt_k, cvt_b = self.k_sigma(isos, self.anchor_iso)
+        cvt_k = cvt_k.astype(np.float32)
+        cvt_b = cvt_b.astype(np.float32)
+
+        imgs = imgs * cvt_k.reshape(-1, 1, 1, 1) + cvt_b.reshape(-1, 1, 1, 1)
+        return imgs, cvt_k, cvt_b

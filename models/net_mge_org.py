@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import torch
-import torch.nn as nn
 from collections import OrderedDict
-# from calflops import calculate_flops
-import numpy as np
+
+import megengine as mge
+import megengine.module as M
+import megengine.functional as F
 
 
 def Conv2D(
@@ -14,26 +14,26 @@ def Conv2D(
     modules = OrderedDict()
 
     if is_seperable:
-        modules['depthwise'] = nn.Conv2d(
+        modules['depthwise'] = M.Conv2d(
             in_channels, in_channels, kernel_size, stride, padding,
             groups=in_channels, bias=False,
         )
-        modules['pointwise'] = nn.Conv2d(
+        modules['pointwise'] = M.Conv2d(
             in_channels, out_channels,
             kernel_size=1, stride=1, padding=0, bias=True,
         )
     else:
-        modules['conv'] = nn.Conv2d(
+        modules['conv'] = M.Conv2d(
             in_channels, out_channels, kernel_size, stride, padding,
             bias=True,
         )
     if has_relu:
-        modules['relu'] = nn.ReLU()
+        modules['relu'] = M.ReLU()
 
-    return nn.Sequential(modules)
+    return M.Sequential(modules)
 
 
-class EncoderBlock(nn.Module):
+class EncoderBlock(M.Module):
 
     def __init__(self, in_channels: int, mid_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
@@ -42,11 +42,11 @@ class EncoderBlock(nn.Module):
         self.conv2 = Conv2D(mid_channels, out_channels, kernel_size=5, stride=1, padding=2, is_seperable=True, has_relu=False)
 
         self.proj = (
-            nn.Identity()
+            M.Identity()
             if stride == 1 and in_channels == out_channels else
             Conv2D(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, is_seperable=True, has_relu=False)
         )
-        self.relu = nn.ReLU()
+        self.relu = M.ReLU()
 
     def forward(self, x):
         proj = self.proj(x)
@@ -78,10 +78,10 @@ def EncoderStage(in_channels: int, out_channels: int, num_blocks: int):
             )
         )
 
-    return nn.Sequential(*blocks)
+    return M.Sequential(*blocks)
 
 
-class DecoderBlock(nn.Module):
+class DecoderBlock(M.Module):
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
         super().__init__()
@@ -104,18 +104,17 @@ class DecoderBlock(nn.Module):
         return x
 
 
-class DecoderStage(nn.Module):
+class DecoderStage(M.Module):
 
     def __init__(self, in_channels: int, skip_in_channels: int, out_channels: int):
         super().__init__()
 
         self.decode_conv = DecoderBlock(in_channels, in_channels, kernel_size=3)
-        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2, padding=0)
+        self.upsample = M.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2, padding=0)
         self.proj_conv = Conv2D(skip_in_channels, out_channels, kernel_size=3, stride=1, padding=1, is_seperable=True, has_relu=True)
-        # M.init.msra_normal_(self.upsample.weight, mode='fan_in', nonlinearity='linear')
 
-    def forward(self, inp, skip):
-        # inp, skip = inputs[0], inputs[1]
+    def forward(self, inputs):
+        inp, skip = inputs
 
         x = self.decode_conv(inp)
         x = self.upsample(x)
@@ -123,10 +122,10 @@ class DecoderStage(nn.Module):
         return x + y
 
 
-class Network(nn.Module):
+class Network(M.Module):
 
     def __init__(self):
-        super(Network, self).__init__()
+        super().__init__()
 
         self.conv0 = Conv2D(in_channels=4, out_channels=16, kernel_size=3, padding=1, stride=1, is_seperable=False, has_relu=True)
         self.enc1 = EncoderStage(in_channels=16, out_channels=64, num_blocks=2)
@@ -153,10 +152,10 @@ class Network(nn.Module):
 
         conv5 = self.encdec(conv4)
 
-        up3 = self.dec1(conv5, conv3)
-        up2 = self.dec2(up3, conv2)
-        up1 = self.dec3(up2, conv1)
-        x = self.dec4(up1, conv0)
+        up3 = self.dec1((conv5, conv3))
+        up2 = self.dec2((up3, conv2))
+        up1 = self.dec3((up2, conv1))
+        x = self.dec4((up1, conv0))
 
         x = self.out0(x)
         x = self.out1(x)
@@ -165,36 +164,18 @@ class Network(nn.Module):
         return pred
 
 
+def get_loss_l1(pred: mge.Tensor, label: mge.Tensor, norm_k: mge.Tensor):
+    B = pred.shape[0]
+    L1 = F.abs(pred - label).reshape(B, -1).mean(axis=1)
+    L1 = L1 / norm_k.flatten()
+    return L1.mean()
+
+
 if __name__ == "__main__":
-    from ptflops import get_model_complexity_info
-    # from arch_util import measure_inference_speed
-    
+    import numpy as np
+
     net = Network()
-    # img = mge.tensor(np.random.randn(1, 4, 64, 64).astype(np.float32))
-    img = torch.randn(1, 4, 64, 64, device=torch.device('cpu'), dtype=torch.float32)
-    macs, params = get_model_complexity_info(net, (4, 544, 960), verbose=False, print_per_layer_stat=False)
-    print(macs, params)
-    net.eval()
-    dummy_input = torch.randn((1, 4, 544, 960), requires_grad=True)
-    torch.onnx.export(net,         # model being run 
-        dummy_input,       # model input (or a tuple for multiple inputs) 
-        "pmrid.onnx",       # where to save the model  
-        export_params=True,  # store the trained parameter weights inside the model file 
-        opset_version=10,    # the ONNX version to export the model to 
-        do_constant_folding=True,  # whether to execute constant folding for optimization 
-        input_names = ['modelInput'],   # the model's input names 
-        output_names = ['modelOutput']) # the model's output names 
-        # dynamic_axes={'modelInput' : {0 : 1},    # variable length axes 
-        #                     'modelOutput' : {0 : 1}}) 
+    img = mge.tensor(np.random.randn(1, 4, 64, 64).astype(np.float32))
     out = net(img)
-    # flops, macs, params = calculate_flops(model=net, 
-    #                                   input_shape=(1, 4, 544, 960),
-    #                                   output_as_string=True,
-    #                                   output_precision=4)
-    # print("FLOPs:%s   MACs:%s   Params:%s \n" %(flops, macs, params))
-    torch.save(net, 'pmrid.pth')
-    scripted_model = torch.jit.script(net)
-    scripted_model.save('pmrid.pt')
-    # import IPython; IPython.embed()
 
 # vim: ts=4 sw=4 sts=4 expandtab

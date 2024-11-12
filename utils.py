@@ -53,9 +53,14 @@ class RawUtils:
         wb_gain = np.array(wb_gain)[[0, 1, 1, 2]]
         res = []
         for bayer_01 in bayer_01s:
+            bayer_01 = bayer_01.transpose(1, 2, 0)
             bayer = cls.rggb2bayer(
-                (cls.bayer2rggb(bayer_01) * wb_gain).clip(0, 1)
+                (bayer_01 * wb_gain).clip(0, 1)
             ).astype(np.float32)
+
+            # bayer = cls.rggb2bayer(
+            #     (cls.bayer2rggb(bayer_01) * wb_gain).clip(0, 1)
+            # ).astype(np.float32)
             bayer = np.round(np.ascontiguousarray(bayer) * 65535).clip(0, 65535).astype(np.uint16)
             rgb = cv2.cvtColor(bayer, cv2.COLOR_BAYER_BG2RGB_EA).astype(np.float32) / 65535
             rgb = rgb.dot(np.array(CCM).T).clip(0, 1)
